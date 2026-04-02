@@ -7381,7 +7381,7 @@ async def booking_phone_contact_handler(message: Message, state: FSMContext) -> 
         await state.set_state(BookingFSM.waiting_client_name)
         await update_current_static_screen(
             message.from_user.id,
-            "👤 Имя слишком короткое.\n\nВведите минимум 2 символа.",
+            "\U0001f464 \u041a\u0430\u043a \u043f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c \u0437\u0430\u043f\u0438\u0441\u044c?\n\n\u041c\u043e\u0436\u043d\u043e \u0432\u0437\u044f\u0442\u044c \u0438\u043c\u044f \u0438\u0437 Telegram \u0438\u043b\u0438 \u0432\u0432\u0435\u0441\u0442\u0438 \u0441\u0432\u043e\u0451.",
             reply_markup=booking_name_kb(),
         )
     await try_delete_user_message(message)
@@ -8856,7 +8856,7 @@ async def admin_master_add_start(callback: CallbackQuery, state: FSMContext) -> 
     await state.set_state(AdminFSM.waiting_new_master_name)
     await update_static_screen_from_callback(
         callback,
-        "👤 Имя слишком короткое.\n\nВведите минимум 2 символа.",
+        "\U0001f464 \u041d\u043e\u0432\u044b\u0439 \u043c\u0430\u0441\u0442\u0435\u0440\n\n\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0438\u043c\u044f \u043c\u0430\u0441\u0442\u0435\u0440\u0430.",
         reply_markup=admin_back_kb(back_callback="admin:masters", back_text="⬅️ К мастерам"),
     )
     await callback.answer()
