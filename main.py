@@ -297,7 +297,7 @@ MONTH_NAMES_RU_GEN = {
 
 
 # =====================================================
-# 2) ????????????? aiogram ? ????????????
+# 2) Инициализация aiogram и планировщика
 # =====================================================
 router = Router()
 dp = Dispatcher()
@@ -6278,7 +6278,7 @@ def format_admin_management_text() -> str:
         [
             "",
             "Эти ID получают внутренний доступ к рабочему контуру.",
-            "???????? ?????? ????? ?????? ????????.",
+            "Изменять список может только владелец.",
         ]
     )
     return "\n".join(lines)
@@ -6530,7 +6530,7 @@ async def sale_entry_handler(message: Message, state: FSMContext) -> None:
     if is_manager_only(message.from_user.id):
         await render_inline_screen(
             message.from_user.id,
-            "? ??????? ? ????-???? ???????? ?????? owner. ??????????? lead-??????.",
+            "⛔ Покупка в демо-боте доступна только owner. Используйте lead-ссылку.",
             reply_markup=main_menu_kb(message.from_user.id),
         )
         return
@@ -7381,7 +7381,7 @@ async def booking_phone_contact_handler(message: Message, state: FSMContext) -> 
         await state.set_state(BookingFSM.waiting_client_name)
         await update_current_static_screen(
             message.from_user.id,
-            "?? ??? ??????? ????????.\n\n??????? ??????? 2 ???????.",
+            "👤 Имя слишком короткое.\n\nВведите минимум 2 символа.",
             reply_markup=booking_name_kb(),
         )
     await try_delete_user_message(message)
@@ -7965,7 +7965,7 @@ async def buy_bot_message_handler(message: Message, state: FSMContext) -> None:
     if is_manager_only(message.from_user.id):
         await send_static_screen(
             message.from_user.id,
-            "? ??????? ? ????-???? ???????? ?????? owner. ??????????? lead-??????.",
+            "⛔ Покупка в демо-боте доступна только owner. Используйте lead-ссылку.",
             reply_markup=main_menu_kb(message.from_user.id),
         )
         return
@@ -8807,7 +8807,7 @@ async def admin_slot_add_time_finish(message: Message, state: FSMContext) -> Non
     if normalized is None:
         await send_static_screen(
             message.from_user.id,
-            "???????? ?????? ???????. ??????????? HH:MM.",
+            "Неверный формат времени. Используйте HH:MM.",
             reply_markup=admin_back_kb(
                 back_callback=f"adm_slot_back:{date_str}",
                 back_text="⬅️ К дате",
@@ -8856,7 +8856,7 @@ async def admin_master_add_start(callback: CallbackQuery, state: FSMContext) -> 
     await state.set_state(AdminFSM.waiting_new_master_name)
     await update_static_screen_from_callback(
         callback,
-        "?? ??? ??????? ????????.\n\n??????? ??????? 2 ???????.",
+        "👤 Имя слишком короткое.\n\nВведите минимум 2 символа.",
         reply_markup=admin_back_kb(back_callback="admin:masters", back_text="⬅️ К мастерам"),
     )
     await callback.answer()
@@ -9032,7 +9032,7 @@ async def admin_master_rename_finish(message: Message, state: FSMContext) -> Non
     if len(name) < 2:
         await send_static_screen(
             message.from_user.id,
-            "??? ?????? ????????? ??????? 2 ???????.",
+            "Имя должно содержать минимум 2 символа.",
             reply_markup=admin_back_kb(
                 back_callback=f"adm_master_open:{int(master_id)}",
                 back_text="⬅️ К мастеру",
