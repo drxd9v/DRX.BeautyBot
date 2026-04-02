@@ -194,7 +194,7 @@ DEMO_FEATURES = {
         "title": "🛠 Услуги и цены",
         "description": (
             "Полное управление услугами: добавить, изменить цену, скрыть или удалить позицию.\n"
-            "Рзменения сразу применяются в записи клиента."
+            "Изменения сразу применяются в записи клиента."
         ),
         "open_callback": "admin:services",
     },
@@ -271,8 +271,8 @@ MONTH_NAMES_RU = {
     3: "Март",
     4: "Апрель",
     5: "Май",
-    6: "Рюнь",
-    7: "Рюль",
+    6: "Июнь",
+    7: "Июль",
     8: "Август",
     9: "Сентябрь",
     10: "Октябрь",
@@ -297,7 +297,7 @@ MONTH_NAMES_RU_GEN = {
 
 
 # =====================================================
-# 2) Рнициализация aiogram и планировщика
+# 2) ????????????? aiogram ? ????????????
 # =====================================================
 router = Router()
 dp = Dispatcher()
@@ -5021,7 +5021,7 @@ def admin_master_detail_kb(master_id: int, demo_owner_id: int | None = None) -> 
                 InlineKeyboardButton(text="🪟 Окошки", callback_data=f"adm_slot_master:{master_id}"),
             ],
             [
-                InlineKeyboardButton(text="вњЏпёЏ Рмя", callback_data=f"adm_master_rename:{master_id}"),
+                InlineKeyboardButton(text="✏️ Имя", callback_data=f"adm_master_rename:{master_id}"),
                 InlineKeyboardButton(text="✨ Специализация", callback_data=f"adm_master_spec:{master_id}"),
             ],
             [
@@ -5683,7 +5683,7 @@ async def send_reminder_job(appointment_id: int, hours_before: int) -> None:
             continue
         comment = (row["client_comment"] or "").strip()
         comment_line = f"\nКомментарий: {escape(comment)}" if comment else ""
-        source_line = "\nРсходник: прикреплен" if row["source_file_id"] else ""
+        source_line = "\nИсходник: прикреплён" if row["source_file_id"] else ""
         profile_link = profile_link_html(int(row["user_id"]))
         try:
             await bot_instance.send_message(
@@ -5746,7 +5746,7 @@ async def notify_admin_about_new_appointment(appointment_id: int) -> None:
             )
             if row["source_file_id"]:
                 caption = (
-                    f"рџ“Ћ Рсходник клиента для записи ID {row['id']}\n"
+                    f"📎 Исходник клиента для записи ID {row['id']}\n"
                     f"Клиент: {escape(str(row['client_name']))}"
                 )
                 if row["source_file_type"] == "document":
@@ -6278,7 +6278,7 @@ def format_admin_management_text() -> str:
         [
             "",
             "Эти ID получают внутренний доступ к рабочему контуру.",
-            "Рзменять список может только владелец.",
+            "???????? ?????? ????? ?????? ????????.",
         ]
     )
     return "\n".join(lines)
@@ -6530,7 +6530,7 @@ async def sale_entry_handler(message: Message, state: FSMContext) -> None:
     if is_manager_only(message.from_user.id):
         await render_inline_screen(
             message.from_user.id,
-            "⛔ Покупка в демо-боте доступна только owner. Рспользуйте lead-ссылку.",
+            "? ??????? ? ????-???? ???????? ?????? owner. ??????????? lead-??????.",
             reply_markup=main_menu_kb(message.from_user.id),
         )
         return
@@ -7514,7 +7514,7 @@ async def booking_back_to_name_callback(callback: CallbackQuery, state: FSMConte
     await state.set_state(BookingFSM.waiting_client_name)
     await update_static_screen_from_callback(
         callback,
-        "👤 Введите имя клиента\n\nРли используйте имя из профиля.",
+        "👤 Введите имя клиента\n\nИли используйте имя из профиля.",
         reply_markup=booking_name_kb(),
     )
 
@@ -7619,7 +7619,7 @@ async def booking_source_message_handler(message: Message, state: FSMContext) ->
     if not source_file_id:
         await update_current_static_screen(
             message.from_user.id,
-            "📎 Отправьте фото или файл.\n\nРли нажмите «Пропустить».",
+            "📎 Отправьте фото или файл.\n\nИли нажмите «Пропустить».",
             reply_markup=booking_source_kb(),
         )
         return
@@ -7772,7 +7772,7 @@ async def booking_edit_name_callback(callback: CallbackQuery, state: FSMContext)
     await state.set_state(BookingFSM.waiting_client_name)
     await update_static_screen_from_callback(
         callback,
-        "👤 Введите имя клиента\n\nРли используйте имя из профиля.",
+        "👤 Введите имя клиента\n\nИли используйте имя из профиля.",
         reply_markup=booking_name_kb(),
     )
 
@@ -7965,7 +7965,7 @@ async def buy_bot_message_handler(message: Message, state: FSMContext) -> None:
     if is_manager_only(message.from_user.id):
         await send_static_screen(
             message.from_user.id,
-            "⛔ Покупка в демо-боте доступна только owner. Рспользуйте lead-ссылку.",
+            "? ??????? ? ????-???? ???????? ?????? owner. ??????????? lead-??????.",
             reply_markup=main_menu_kb(message.from_user.id),
         )
         return
@@ -8807,7 +8807,7 @@ async def admin_slot_add_time_finish(message: Message, state: FSMContext) -> Non
     if normalized is None:
         await send_static_screen(
             message.from_user.id,
-            "Неверный формат времени. Рспользуйте HH:MM.",
+            "???????? ?????? ???????. ??????????? HH:MM.",
             reply_markup=admin_back_kb(
                 back_callback=f"adm_slot_back:{date_str}",
                 back_text="⬅️ К дате",
@@ -9032,7 +9032,7 @@ async def admin_master_rename_finish(message: Message, state: FSMContext) -> Non
     if len(name) < 2:
         await send_static_screen(
             message.from_user.id,
-            "Рмя должно содержать минимум 2 символа.",
+            "??? ?????? ????????? ??????? 2 ???????.",
             reply_markup=admin_back_kb(
                 back_callback=f"adm_master_open:{int(master_id)}",
                 back_text="⬅️ К мастеру",
