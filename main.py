@@ -6202,7 +6202,7 @@ async def open_booking_confirmation_screen(
             reply_markup=reply_markup,
         )
         return
-    await update_current_static_screen(
+    await render_inline_screen(
         user_id,
         build_booking_confirmation_text(data),
         reply_markup=reply_markup,
@@ -7242,8 +7242,8 @@ async def calendar_day_callback(callback: CallbackQuery, state: FSMContext) -> N
         return
 
     await state.set_state(BookingFSM.choosing_time)
-    await update_static_screen_from_callback(
-        callback,
+    await render_inline_screen(
+        callback.from_user.id,
         f"📅 {format_date_human(date_str)}\n\n🕒 Выберите время.",
         reply_markup=time_slots_kb(
             free_slots,
@@ -7362,7 +7362,6 @@ async def booking_phone_contact_handler(message: Message, state: FSMContext) -> 
         return
 
     await clear_aux_messages(message.from_user.id)
-    await hide_reply_keyboard(message.from_user.id)
     phone = normalize_phone_input(str(contact.phone_number or "").strip())
     if not phone:
         data = await state.get_data()
@@ -7379,7 +7378,7 @@ async def booking_phone_contact_handler(message: Message, state: FSMContext) -> 
         await open_booking_confirmation_screen(message.from_user.id, state)
     else:
         await state.set_state(BookingFSM.waiting_client_name)
-        await update_current_static_screen(
+        await render_inline_screen(
             message.from_user.id,
             "\U0001f464 \u041a\u0430\u043a \u043f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c \u0437\u0430\u043f\u0438\u0441\u044c?\n\n\u041c\u043e\u0436\u043d\u043e \u0432\u0437\u044f\u0442\u044c \u0438\u043c\u044f \u0438\u0437 Telegram \u0438\u043b\u0438 \u0432\u0432\u0435\u0441\u0442\u0438 \u0441\u0432\u043e\u0451.",
             reply_markup=booking_name_kb(),
@@ -7391,8 +7390,6 @@ async def booking_phone_contact_handler(message: Message, state: FSMContext) -> 
 async def booking_phone_text_fallback(message: Message, state: FSMContext) -> None:
     await try_delete_user_message(message)
     await clear_aux_messages(message.from_user.id)
-    if is_reply_keyboard_active(message.from_user.id):
-        await hide_reply_keyboard(message.from_user.id)
     if (message.text or "").strip() == "⬅️ Назад":
         data = await state.get_data()
         back_to = str(data.get("booking_phone_back_to") or "time")
@@ -7411,7 +7408,7 @@ async def booking_phone_text_fallback(message: Message, state: FSMContext) -> No
             master_id=master_id,
         )
         await state.set_state(BookingFSM.choosing_time)
-        await update_current_static_screen(
+        await render_inline_screen(
             message.from_user.id,
             f"📅 {format_date_human(date_str)}\n\nВыберите время.",
             reply_markup=time_slots_kb(
@@ -7440,7 +7437,7 @@ async def booking_phone_text_fallback(message: Message, state: FSMContext) -> No
         return
 
     await state.set_state(BookingFSM.waiting_client_name)
-    await update_current_static_screen(
+    await render_inline_screen(
         message.from_user.id,
         "👤 Как подписать запись?\n\nМожно взять имя из Telegram или ввести своё.",
         reply_markup=booking_name_kb(),
@@ -7805,7 +7802,6 @@ async def booking_edit_source_callback(callback: CallbackQuery, state: FSMContex
 async def booking_return_time_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await ack_callback(callback)
     await clear_aux_messages(callback.from_user.id)
-    await hide_reply_keyboard(callback.from_user.id)
     data = await state.get_data()
     date_str = str(data.get("booking_date") or "")
     if not date_str:
@@ -7835,8 +7831,7 @@ async def booking_return_time_callback(callback: CallbackQuery, state: FSMContex
 async def booking_return_confirm_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await ack_callback(callback)
     await clear_aux_messages(callback.from_user.id)
-    await hide_reply_keyboard(callback.from_user.id)
-    await open_booking_confirmation_screen(callback.from_user.id, state, callback=callback)
+    await open_booking_confirmation_screen(callback.from_user.id, state)
 
 
 @router.callback_query(F.data == "confirm:yes")
