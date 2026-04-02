@@ -6366,10 +6366,19 @@ async def open_booking_phone_step(
     await state.update_data(booking_phone_back_to=back_to)
     await state.set_state(BookingFSM.waiting_phone)
     text = build_booking_phone_step_text(data, back_to)
-    await send_static_screen(
+    back_callback = "booking:return_confirm" if back_to == "confirm" else "booking:return_time"
+    back_text = "⬅️ К подтверждению" if back_to == "confirm" else "⬅️ К выбору времени"
+    if callback is not None:
+        await render_inline_screen_from_callback(
+            callback,
+            text,
+            reply_markup=booking_phone_step_kb(back_callback, back_text),
+        )
+        return
+    await render_inline_screen(
         user_id,
         text,
-        reply_markup=phone_request_kb(),
+        reply_markup=booking_phone_step_kb(back_callback, back_text),
     )
 
 
@@ -7456,7 +7465,13 @@ async def booking_phone_contact_request_callback(callback: CallbackQuery, state:
     await ack_callback(callback)
     data = await state.get_data()
     back_to = str(data.get("booking_phone_back_to") or "time")
-    await open_booking_phone_step(callback.from_user.id, state, callback=callback, back_to=back_to)
+    await state.update_data(booking_phone_back_to=back_to)
+    await state.set_state(BookingFSM.waiting_phone)
+    await send_temporary_prompt(
+        callback.from_user.id,
+        "📱 Отправьте номер кнопкой ниже.\n\nИли введите его вручную одним сообщением.",
+        reply_markup=phone_request_kb(),
+    )
 
 
 @router.callback_query(F.data == "booking:name_profile")
