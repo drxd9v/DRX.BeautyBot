@@ -1,0 +1,15 @@
+.env
+.env.txt
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+bot.db
+bot_stdout.log
+bot_stderr.log
+.obsidian/workspace.json
+.obsidian/workspaces.json
+.obsidian/cache/
+.obsidian/plugins/
+oracle_transfer.zip
