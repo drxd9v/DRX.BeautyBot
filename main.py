@@ -2154,9 +2154,19 @@ def get_demo_leads(limit: int = 50, assigned_by: int | None = None) -> list[sqli
     with get_connection() as conn:
         rows = conn.execute(
             f"""
-            SELECT l.user_id, l.status, l.assigned_by, l.assigned_at, l.paid_at, u.full_name, u.username
+            SELECT
+                l.user_id,
+                l.status,
+                l.assigned_by,
+                l.assigned_at,
+                l.paid_at,
+                u.full_name,
+                u.username,
+                manager.full_name AS manager_full_name,
+                manager.username AS manager_username
             FROM demo_leads l
             LEFT JOIN users u ON u.user_id = l.user_id
+            LEFT JOIN users manager ON manager.user_id = l.assigned_by
             {where_sql}
             ORDER BY l.assigned_at DESC
             LIMIT ?
@@ -8247,7 +8257,18 @@ def format_leads_overview_text(viewer_id: int) -> str:
         status = "✅ оплачен" if str(row["status"]) == "paid" else "🆕 лид"
         name = escape(str(row["full_name"] or row["user_id"]))
         username = f" (@{escape(str(row['username']))})" if row["username"] else ""
-        lines.append(f"{idx}. {name}{username} · ID {row['user_id']} · {status}")
+        if is_owner(viewer_id):
+            manager_identity = "не назначен"
+            if row["assigned_by"] is not None:
+                manager_name = escape(str(row["manager_full_name"] or row["assigned_by"]))
+                manager_username = f" (@{escape(str(row['manager_username']))})" if row["manager_username"] else ""
+                manager_identity = f"{manager_name}{manager_username}"
+            lines.append(
+                f"{idx}. {name}{username} · ID {row['user_id']} · {status}\n"
+                f"   ↳ Кто привел: {manager_identity}"
+            )
+        else:
+            lines.append(f"{idx}. {name}{username} · ID {row['user_id']} · {status}")
     return "\n".join(lines)
 
 
