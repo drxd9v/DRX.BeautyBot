@@ -3372,6 +3372,33 @@ async def notify_owner_about_new_lead(
         pass
 
 
+async def notify_manager_about_new_lead(
+    manager_id: int,
+    lead_user_id: int,
+    lead_full_name: str,
+    lead_username: str | None,
+) -> None:
+    if bot_instance is None:
+        return
+    lead_identity = format_user_identity(
+        user_id=lead_user_id,
+        full_name=lead_full_name,
+        username=lead_username,
+    )
+    try:
+        await bot_instance.send_message(
+            chat_id=manager_id,
+            text=(
+                "🎯 Новый лид по вашей ссылке\n\n"
+                f"Клиент: {lead_identity}\n"
+                f"Профиль клиента: <a href='tg://user?id={lead_user_id}'>Открыть</a>\n\n"
+                "Лид уже добавлен в ваш список."
+            ),
+        )
+    except Exception:
+        pass
+
+
 def appointment_datetime(date_str: str, time_str: str) -> datetime:
     date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
     time_obj = datetime.strptime(time_str, "%H:%M").time()
@@ -4754,10 +4781,13 @@ def lead_manager_list_kb(viewer_id: int, limit: int = 25) -> InlineKeyboardMarku
         name = str(row["full_name"] or lead_user_id)
         status = "Оплачен" if str(row["status"]) == "paid" else "Лид"
         if is_owner(viewer_id):
+            manager_label = "не назначен"
+            if row["assigned_by"] is not None:
+                manager_label = str(row["manager_full_name"] or row["assigned_by"] )
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=f"❌ Удалить: {name} ({status})",
+                        text=f"❌ {name} · {manager_label} · {status}",
                         callback_data=f"leadmgr:remove:{lead_user_id}",
                     )
                 ]
@@ -5828,6 +5858,12 @@ async def start_handler(message: Message, state: FSMContext) -> None:
             _is_new, manager_changed = assign_demo_lead(user_id, manager_from_link)
             if manager_changed:
                 await notify_owner_about_new_lead(
+                    manager_id=manager_from_link,
+                    lead_user_id=user_id,
+                    lead_full_name=message.from_user.full_name,
+                    lead_username=message.from_user.username,
+                )
+                await notify_manager_about_new_lead(
                     manager_id=manager_from_link,
                     lead_user_id=user_id,
                     lead_full_name=message.from_user.full_name,
