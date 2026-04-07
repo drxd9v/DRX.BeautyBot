@@ -50,6 +50,7 @@ MANAGER_IDS = (os.getenv("MANAGER_IDS") or "").strip().strip("\"'")
 PAYMENT_PROVIDER_TOKEN = (os.getenv("PAYMENT_PROVIDER_TOKEN") or "").strip().strip("\"'")
 PAYMENT_CURRENCY = (os.getenv("PAYMENT_CURRENCY") or "USD").strip().upper().strip("\"'")
 MINI_APP_URL = (os.getenv("MINI_APP_URL") or "").strip().strip("\"'")
+MINI_APP_PUBLIC_API_BASE_URL = (os.getenv("MINI_APP_PUBLIC_API_BASE_URL") or "").strip().strip("\"'")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN в .env")
@@ -5828,6 +5829,8 @@ def build_mini_app_launch_url(user_id: int) -> str:
     parts = urlsplit(base_url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     query["ownerId"] = str(workspace_owner_id)
+    if MINI_APP_PUBLIC_API_BASE_URL:
+        query["apiBase"] = MINI_APP_PUBLIC_API_BASE_URL
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
