@@ -4,11 +4,15 @@ import os
 import re
 import secrets
 import sqlite3
+import traceback
 from contextvars import ContextVar
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from functools import wraps
 from html import escape
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
@@ -110,6 +114,17 @@ ALL_TIME_SLOTS = ("09:00", "12:00", "15:00", "18:00")
 SYSTEM_DEMO_OWNER_ID = 0
 CURRENT_DEMO_OWNER_ID: ContextVar[int] = ContextVar("current_demo_owner_id", default=SYSTEM_DEMO_OWNER_ID)
 DEFAULT_DEMO_REFERENCE_IMAGE = os.path.join("assets", "demo_reference.jpg")
+MINI_APP_API_HOST = (os.getenv("MINI_APP_API_HOST") or "0.0.0.0").strip().strip("\"'")
+try:
+    MINI_APP_API_PORT = int((os.getenv("PORT") or os.getenv("MINI_APP_API_PORT") or "8080").strip().strip("\"'"))
+except ValueError as exc:
+    raise RuntimeError("MINI_APP_API_PORT должен быть целым числом") from exc
+try:
+    MINI_APP_DRAFT_TTL_MINUTES = int(
+        (os.getenv("MINI_APP_DRAFT_TTL_MINUTES") or "15").strip().strip("\"'")
+    )
+except ValueError as exc:
+    raise RuntimeError("MINI_APP_DRAFT_TTL_MINUTES должен быть целым числом") from exc
 DEFAULT_MASTER_NAME = "Основной мастер"
 DEMO_MASTER_TEMPLATES = ("Анна", "Мария", "София")
 DEFAULT_MASTER_SPECIALIZATION = "Бьюти-мастер"
@@ -855,6 +870,35 @@ def init_db() -> None:
                 ON appointments (demo_owner_id, appointment_date, appointment_time, master_id)
                 """
             )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_booking_drafts (
+                draft_id TEXT PRIMARY KEY,
+                demo_owner_id INTEGER NOT NULL,
+                telegram_user_id INTEGER,
+                source TEXT,
+                manager_id INTEGER,
+                master_id INTEGER NOT NULL,
+                service_id INTEGER NOT NULL,
+                appointment_date TEXT NOT NULL,
+                appointment_time TEXT NOT NULL,
+                client_phone TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                client_comment TEXT,
+                reference_file_id TEXT,
+                reference_file_type TEXT,
+                reference_file_name TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mini_app_booking_drafts_owner_expiry
+            ON mini_app_booking_drafts (demo_owner_id, expires_at)
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS services (
@@ -3442,6 +3486,815 @@ def shorten_text(value: str, limit: int = 38) -> str:
     return clean[: max(0, limit - 1)].rstrip() + "…"
 
 
+class MiniAppApiError(Exception):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status: int = 400,
+        details: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.details = details
+
+
+def mini_app_error_response(
+    code: str,
+    message: str,
+    *,
+    status: int = 400,
+    details: object | None = None,
+) -> web.Response:
+    return web.json_response(
+        {"error": {"code": code, "message": message, "details": details}},
+        status=status,
+    )
+
+
+def mini_app_api_handler(handler):
+    @wraps(handler)
+    async def wrapper(request: web.Request) -> web.StreamResponse:
+        try:
+            return await handler(request)
+        except MiniAppApiError as exc:
+            return mini_app_error_response(
+                exc.code,
+                exc.message,
+                status=exc.status,
+                details=exc.details,
+            )
+        except Exception as exc:
+            print(f"[mini-app] Unhandled API error in {handler.__name__}: {exc}")
+            traceback.print_exc()
+            return mini_app_error_response(
+                "internal_error",
+                "Внутренняя ошибка. Попробуйте ещё раз.",
+                status=500,
+            )
+
+    return wrapper
+
+
+@web.middleware
+async def mini_app_cors_middleware(
+    request: web.Request,
+    handler,
+) -> web.StreamResponse:
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return response
+
+
+def serialize_api_datetime(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def cleanup_expired_mini_app_booking_drafts(demo_owner_id: int | None = None) -> None:
+    now_iso = datetime.now(LOCAL_TZ).isoformat()
+    with get_connection() as conn:
+        if demo_owner_id is None:
+            conn.execute(
+                "DELETE FROM mini_app_booking_drafts WHERE expires_at <= ?",
+                (now_iso,),
+            )
+        else:
+            conn.execute(
+                """
+                DELETE FROM mini_app_booking_drafts
+                WHERE demo_owner_id = ? AND expires_at <= ?
+                """,
+                (int(demo_owner_id), now_iso),
+            )
+
+
+def create_mini_app_booking_draft(
+    *,
+    demo_owner_id: int,
+    telegram_user_id: int | None,
+    source: str | None,
+    manager_id: int | None,
+    master_id: int,
+    service_id: int,
+    appointment_date: str,
+    appointment_time: str,
+    client_phone: str,
+    client_name: str,
+    client_comment: str | None,
+    reference_file_id: str | None,
+    reference_file_type: str | None,
+    reference_file_name: str | None,
+) -> sqlite3.Row:
+    owner_id = int(demo_owner_id)
+    cleanup_expired_mini_app_booking_drafts(owner_id)
+    now_dt = datetime.now(LOCAL_TZ)
+    expires_dt = now_dt + timedelta(minutes=max(1, MINI_APP_DRAFT_TTL_MINUTES))
+
+    with get_connection() as conn:
+        for _ in range(5):
+            draft_id = f"draft_{secrets.token_urlsafe(9)}"
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO mini_app_booking_drafts (
+                        draft_id, demo_owner_id, telegram_user_id, source, manager_id,
+                        master_id, service_id, appointment_date, appointment_time,
+                        client_phone, client_name, client_comment,
+                        reference_file_id, reference_file_type, reference_file_name,
+                        created_at, expires_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        draft_id,
+                        owner_id,
+                        telegram_user_id,
+                        source,
+                        manager_id,
+                        int(master_id),
+                        int(service_id),
+                        appointment_date,
+                        appointment_time,
+                        client_phone,
+                        client_name,
+                        client_comment,
+                        reference_file_id,
+                        reference_file_type,
+                        reference_file_name,
+                        now_dt.isoformat(),
+                        expires_dt.isoformat(),
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM mini_app_booking_drafts WHERE draft_id = ?",
+                    (draft_id,),
+                ).fetchone()
+                if row is not None:
+                    return row
+            except sqlite3.IntegrityError:
+                continue
+    raise MiniAppApiError("internal_error", "Не удалось создать черновик записи.", status=500)
+
+
+def get_mini_app_booking_draft(draft_id: str, demo_owner_id: int) -> sqlite3.Row | None:
+    cleanup_expired_mini_app_booking_drafts(demo_owner_id)
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM mini_app_booking_drafts
+            WHERE draft_id = ? AND demo_owner_id = ?
+            """,
+            (draft_id, int(demo_owner_id)),
+        ).fetchone()
+    return row
+
+
+def delete_mini_app_booking_draft(draft_id: str, demo_owner_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            DELETE FROM mini_app_booking_drafts
+            WHERE draft_id = ? AND demo_owner_id = ?
+            """,
+            (draft_id, int(demo_owner_id)),
+        )
+
+
+async def read_mini_app_json_body(request: web.Request) -> dict:
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise MiniAppApiError("validation_error", "Некорректный JSON body.", status=400) from exc
+    if not isinstance(payload, dict):
+        raise MiniAppApiError("validation_error", "JSON body должен быть объектом.", status=400)
+    return payload
+
+
+def get_mini_app_param(request: web.Request, key: str, payload: dict | None = None) -> object | None:
+    if key in request.query:
+        return request.query.get(key)
+    if payload is not None and key in payload:
+        return payload.get(key)
+    return None
+
+
+def parse_optional_int(value: object, field_name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise MiniAppApiError("validation_error", f"{field_name} должен быть числом.", status=400) from exc
+
+
+def parse_required_int(value: object, field_name: str) -> int:
+    parsed = parse_optional_int(value, field_name)
+    if parsed is None:
+        raise MiniAppApiError("validation_error", f"{field_name} обязателен.", status=400)
+    return parsed
+
+
+def parse_required_date(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise MiniAppApiError("validation_error", "date обязателен.", status=400)
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise MiniAppApiError("validation_error", "date должен быть в формате YYYY-MM-DD.", status=400) from exc
+
+
+def parse_required_time(value: object) -> str:
+    normalized = normalize_time_str(str(value or "").strip())
+    if normalized is None:
+        raise MiniAppApiError("validation_error", "time должен быть в формате HH:MM.", status=400)
+    return normalized
+
+
+def parse_mini_app_month(value: object | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return datetime.now(LOCAL_TZ).strftime("%Y-%m")
+    try:
+        return datetime.strptime(raw, "%Y-%m").strftime("%Y-%m")
+    except ValueError as exc:
+        raise MiniAppApiError("validation_error", "month должен быть в формате YYYY-MM.", status=400) from exc
+
+
+def parse_mini_app_reference(reference_raw: object) -> dict[str, str] | None:
+    if reference_raw in (None, ""):
+        return None
+    if not isinstance(reference_raw, dict):
+        raise MiniAppApiError("validation_error", "reference должен быть объектом.", status=400)
+    file_type = str(reference_raw.get("type") or "").strip()
+    file_id = str(reference_raw.get("fileId") or "").strip()
+    file_name = str(reference_raw.get("fileName") or "").strip()
+    if not file_type or not file_id:
+        raise MiniAppApiError(
+            "validation_error",
+            "reference должен содержать type и fileId.",
+            status=400,
+        )
+    payload = {"type": file_type, "fileId": file_id}
+    if file_name:
+        payload["fileName"] = file_name
+    return payload
+
+
+def parse_bool_query(value: object | None, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise MiniAppApiError("validation_error", "Булев параметр должен быть true или false.", status=400)
+
+
+def get_mini_app_owner_id(request: web.Request, payload: dict | None = None) -> int:
+    owner_id = parse_optional_int(get_mini_app_param(request, "ownerId", payload), "ownerId")
+    resolved_owner_id = owner_id if owner_id is not None and owner_id > 0 else OWNER_ID_INT
+    ensure_demo_workspace(resolved_owner_id)
+    return resolved_owner_id
+
+
+def get_mini_app_active_master(
+    demo_owner_id: int,
+    master_id: int | None,
+    *,
+    allow_primary_fallback: bool,
+) -> sqlite3.Row:
+    owner_id = int(demo_owner_id)
+    if master_id is None:
+        if not allow_primary_fallback:
+            raise MiniAppApiError("validation_error", "masterId обязателен.", status=400)
+        row = get_primary_master(demo_owner_id=owner_id, active_only=True)
+    else:
+        row = get_master_by_id(master_id, demo_owner_id=owner_id)
+        if row is not None and int(row["is_active"]) != 1:
+            row = None
+    if row is None:
+        raise MiniAppApiError("not_found", "Мастер не найден.", status=404)
+    return row
+
+
+def get_mini_app_service(
+    demo_owner_id: int,
+    service_id: int,
+    *,
+    master_id: int | None = None,
+) -> sqlite3.Row:
+    row = get_service_by_id(service_id, demo_owner_id=demo_owner_id, master_id=master_id)
+    if row is None or int(row["is_active"]) != 1:
+        raise MiniAppApiError("not_found", "Услуга не найдена.", status=404)
+    return row
+
+
+def get_mini_app_service_rows(
+    demo_owner_id: int,
+    master_id: int | None = None,
+) -> list[sqlite3.Row]:
+    owner_id = int(demo_owner_id)
+    with get_connection() as conn:
+        if master_id is None:
+            rows = conn.execute(
+                """
+                SELECT s.id, s.master_id, s.name, s.price, s.is_active, s.sort_order, m.name AS master_name
+                FROM services s
+                JOIN masters m
+                    ON m.id = s.master_id
+                    AND m.demo_owner_id = s.demo_owner_id
+                WHERE s.demo_owner_id = ? AND s.is_active = 1 AND m.is_active = 1
+                ORDER BY m.sort_order, s.sort_order, s.id
+                """,
+                (owner_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT s.id, s.master_id, s.name, s.price, s.is_active, s.sort_order, m.name AS master_name
+                FROM services s
+                JOIN masters m
+                    ON m.id = s.master_id
+                    AND m.demo_owner_id = s.demo_owner_id
+                WHERE s.demo_owner_id = ? AND s.master_id = ? AND s.is_active = 1 AND m.is_active = 1
+                ORDER BY s.sort_order, s.id
+                """,
+                (owner_id, int(master_id)),
+            ).fetchall()
+    return rows
+
+
+def serialize_mini_app_master(row: sqlite3.Row, primary_master_id: int | None) -> dict[str, object]:
+    return {
+        "id": int(row["id"]),
+        "name": str(row["name"]),
+        "specialization": get_master_specialization_from_row(row),
+        "photoUrl": str(row["photo"] or ""),
+        "shortBio": shorten_text(get_master_description_from_row(row), limit=96),
+        "isPrimary": primary_master_id is not None and int(row["id"]) == int(primary_master_id),
+        "isHidden": int(row["is_active"]) != 1,
+    }
+
+
+def serialize_mini_app_service(row: sqlite3.Row) -> dict[str, object]:
+    master_id = int(row["master_id"])
+    return {
+        "id": int(row["id"]),
+        "name": str(row["name"]),
+        "categoryId": None,
+        "categoryName": None,
+        "price": int(row["price"]),
+        "currency": PAYMENT_CURRENCY,
+        "durationMinutes": None,
+        "description": "",
+        "masterIds": [master_id] if master_id > 0 else [],
+        "isHidden": int(row["is_active"]) != 1,
+    }
+
+
+def serialize_mini_app_reference_from_row(row: sqlite3.Row | dict) -> dict[str, str] | None:
+    file_id = row["reference_file_id"] if hasattr(row, "keys") and "reference_file_id" in row.keys() else row.get("reference_file_id")  # type: ignore[union-attr]
+    file_type = row["reference_file_type"] if hasattr(row, "keys") and "reference_file_type" in row.keys() else row.get("reference_file_type")  # type: ignore[union-attr]
+    file_name = row["reference_file_name"] if hasattr(row, "keys") and "reference_file_name" in row.keys() else row.get("reference_file_name")  # type: ignore[union-attr]
+    if not file_id or not file_type:
+        return None
+    payload = {"type": str(file_type), "fileId": str(file_id)}
+    if file_name:
+        payload["fileName"] = str(file_name)
+    return payload
+
+
+def build_mini_app_booking_summary(
+    *,
+    master_row: sqlite3.Row,
+    service_row: sqlite3.Row,
+    date_str: str,
+    time_str: str,
+    client_name: str,
+    client_phone: str,
+    comment: str | None,
+    reference: dict[str, str] | None,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "master": {"id": int(master_row["id"]), "name": str(master_row["name"])},
+        "service": {
+            "id": int(service_row["id"]),
+            "name": str(service_row["name"]),
+            "price": int(service_row["price"]),
+            "currency": PAYMENT_CURRENCY,
+        },
+        "date": date_str,
+        "time": time_str,
+        "clientName": client_name,
+        "clientPhone": client_phone,
+    }
+    if comment:
+        summary["comment"] = comment
+    if reference is not None:
+        summary["reference"] = reference
+    return summary
+
+
+def prepare_mini_app_booking_payload(
+    demo_owner_id: int,
+    payload: dict,
+) -> dict[str, object]:
+    owner_id = int(demo_owner_id)
+    allow_primary_fallback = not is_master_choice_enabled(demo_owner_id=owner_id)
+    master_row = get_mini_app_active_master(
+        owner_id,
+        parse_optional_int(payload.get("masterId"), "masterId"),
+        allow_primary_fallback=allow_primary_fallback,
+    )
+    service_row = get_mini_app_service(
+        owner_id,
+        parse_required_int(payload.get("serviceId"), "serviceId"),
+        master_id=int(master_row["id"]),
+    )
+    date_str = parse_required_date(payload.get("date"))
+    time_str = parse_required_time(payload.get("time"))
+    if appointment_datetime(date_str, time_str) <= datetime.now(LOCAL_TZ):
+        raise MiniAppApiError(
+            "validation_error",
+            "Нельзя записаться на прошедшую дату или время.",
+            status=400,
+        )
+    client_phone = normalize_phone_input(str(payload.get("clientPhone") or "").strip())
+    if client_phone is None:
+        raise MiniAppApiError(
+            "validation_error",
+            "Номер выглядит неполным. Проверьте и попробуйте ещё раз.",
+            status=400,
+        )
+    client_name = str(payload.get("clientName") or "").strip()
+    if len(client_name) < 2:
+        raise MiniAppApiError(
+            "validation_error",
+            "Имя выглядит слишком коротким. Введите минимум 2 символа.",
+            status=400,
+        )
+    manager_id = parse_optional_int(payload.get("managerId"), "managerId")
+    if manager_id is not None and not (is_manager(manager_id) or is_owner(manager_id)):
+        raise MiniAppApiError(
+            "validation_error",
+            "managerId должен указывать на существующего менеджера.",
+            status=400,
+        )
+    return {
+        "ownerId": owner_id,
+        "masterRow": master_row,
+        "serviceRow": service_row,
+        "date": date_str,
+        "time": time_str,
+        "clientPhone": client_phone,
+        "clientName": client_name,
+        "comment": str(payload.get("comment") or "").strip() or None,
+        "reference": parse_mini_app_reference(payload.get("reference")),
+        "telegramUserId": parse_optional_int(payload.get("telegramUserId"), "telegramUserId"),
+        "source": str(payload.get("source") or "").strip() or None,
+        "managerId": manager_id,
+    }
+
+
+def build_mini_app_home_payload(demo_owner_id: int) -> dict[str, object]:
+    owner_id = int(demo_owner_id)
+    secondary_ctas = [
+        {"label": "Прайс", "action": "open_price"},
+        {"label": "Портфолио", "action": "open_portfolio"},
+    ]
+    if is_master_choice_enabled(demo_owner_id=owner_id):
+        secondary_ctas.append({"label": "Мастера", "action": "open_masters"})
+    return {
+        "mode": get_workspace_booking_mode(demo_owner_id=owner_id),
+        "headline": "Удобная запись к beauty-мастеру",
+        "subline": "Выберите услугу, время и запишитесь без лишней переписки.",
+        "primaryCta": {"label": "Записаться", "action": "start_booking"},
+        "secondaryCtas": secondary_ctas,
+        "trustText": "Клиенту проще записаться. Мастеру проще держать запись в порядке.",
+    }
+
+
+@mini_app_api_handler
+async def mini_app_health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+@mini_app_api_handler
+async def mini_app_home_handler(request: web.Request) -> web.Response:
+    owner_id = get_mini_app_owner_id(request)
+    return web.json_response(build_mini_app_home_payload(owner_id))
+
+
+@mini_app_api_handler
+async def mini_app_masters_handler(request: web.Request) -> web.Response:
+    owner_id = get_mini_app_owner_id(request)
+    visible_only = parse_bool_query(request.query.get("visibleOnly"), default=True)
+    primary_master = get_primary_master(demo_owner_id=owner_id, active_only=True)
+    primary_master_id = int(primary_master["id"]) if primary_master is not None else None
+    with get_connection() as conn:
+        if visible_only:
+            rows = conn.execute(
+                """
+                SELECT id, name, specialization, description, photo, is_active, sort_order
+                FROM masters
+                WHERE demo_owner_id = ? AND is_active = 1
+                ORDER BY sort_order, id
+                """,
+                (owner_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, name, specialization, description, photo, is_active, sort_order
+                FROM masters
+                WHERE demo_owner_id = ?
+                ORDER BY sort_order, id
+                """,
+                (owner_id,),
+            ).fetchall()
+    return web.json_response({"items": [serialize_mini_app_master(row, primary_master_id) for row in rows]})
+
+
+@mini_app_api_handler
+async def mini_app_services_handler(request: web.Request) -> web.Response:
+    owner_id = get_mini_app_owner_id(request)
+    master_id = parse_optional_int(request.query.get("masterId"), "masterId")
+    if master_id is None and not is_master_choice_enabled(demo_owner_id=owner_id):
+        primary_master = get_primary_master(demo_owner_id=owner_id, active_only=True)
+        master_id = int(primary_master["id"]) if primary_master is not None else None
+    if master_id is not None:
+        get_mini_app_active_master(owner_id, master_id, allow_primary_fallback=False)
+    rows = get_mini_app_service_rows(owner_id, master_id=master_id)
+    return web.json_response({"items": [serialize_mini_app_service(row) for row in rows]})
+
+
+@mini_app_api_handler
+async def mini_app_availability_dates_handler(request: web.Request) -> web.Response:
+    owner_id = get_mini_app_owner_id(request)
+    master_row = get_mini_app_active_master(
+        owner_id,
+        parse_optional_int(request.query.get("masterId"), "masterId"),
+        allow_primary_fallback=not is_master_choice_enabled(demo_owner_id=owner_id),
+    )
+    service_id = parse_required_int(request.query.get("serviceId"), "serviceId")
+    get_mini_app_service(owner_id, service_id, master_id=int(master_row["id"]))
+
+    month_value = parse_mini_app_month(request.query.get("month"))
+    month_start = datetime.strptime(month_value, "%Y-%m")
+    today = datetime.now(LOCAL_TZ).date()
+    days_in_month = calendar.monthrange(month_start.year, month_start.month)[1]
+    items: list[dict[str, object]] = []
+    for day in range(1, days_in_month + 1):
+        current_date = datetime(month_start.year, month_start.month, day).date()
+        date_str = current_date.isoformat()
+        if current_date < today:
+            items.append({"date": date_str, "isAvailable": False, "slotsCount": 0})
+            continue
+        slots = get_available_slots_for_booking(
+            date_str,
+            demo_owner_id=owner_id,
+            master_id=int(master_row["id"]),
+        )
+        items.append({"date": date_str, "isAvailable": len(slots) > 0, "slotsCount": len(slots)})
+    return web.json_response({"month": month_value, "items": items})
+
+
+@mini_app_api_handler
+async def mini_app_availability_slots_handler(request: web.Request) -> web.Response:
+    owner_id = get_mini_app_owner_id(request)
+    master_row = get_mini_app_active_master(
+        owner_id,
+        parse_optional_int(request.query.get("masterId"), "masterId"),
+        allow_primary_fallback=not is_master_choice_enabled(demo_owner_id=owner_id),
+    )
+    service_id = parse_required_int(request.query.get("serviceId"), "serviceId")
+    get_mini_app_service(owner_id, service_id, master_id=int(master_row["id"]))
+    date_str = parse_required_date(request.query.get("date"))
+    slots = get_available_slots_for_booking(
+        date_str,
+        demo_owner_id=owner_id,
+        master_id=int(master_row["id"]),
+    )
+    return web.json_response({"date": date_str, "items": [{"time": slot, "isAvailable": True} for slot in slots]})
+
+
+@mini_app_api_handler
+async def mini_app_booking_draft_handler(request: web.Request) -> web.Response:
+    payload = await read_mini_app_json_body(request)
+    owner_id = get_mini_app_owner_id(request, payload)
+    prepared = prepare_mini_app_booking_payload(owner_id, payload)
+    master_row = prepared["masterRow"]
+    service_row = prepared["serviceRow"]
+    date_str = str(prepared["date"])
+    time_str = str(prepared["time"])
+    if not is_slot_free(
+        date_str,
+        time_str,
+        demo_owner_id=owner_id,
+        master_id=int(master_row["id"]),
+    ):
+        raise MiniAppApiError(
+            "slot_already_taken",
+            "Этот слот уже занят. Выберите другой.",
+            status=409,
+        )
+
+    reference = prepared["reference"]
+    draft_row = create_mini_app_booking_draft(
+        demo_owner_id=owner_id,
+        telegram_user_id=prepared["telegramUserId"],
+        source=prepared["source"],
+        manager_id=prepared["managerId"],
+        master_id=int(master_row["id"]),
+        service_id=int(service_row["id"]),
+        appointment_date=date_str,
+        appointment_time=time_str,
+        client_phone=str(prepared["clientPhone"]),
+        client_name=str(prepared["clientName"]),
+        client_comment=prepared["comment"],
+        reference_file_id=reference["fileId"] if isinstance(reference, dict) else None,
+        reference_file_type=reference["type"] if isinstance(reference, dict) else None,
+        reference_file_name=reference.get("fileName") if isinstance(reference, dict) else None,
+    )
+    return web.json_response(
+        {
+            "draftId": str(draft_row["draft_id"]),
+            "summary": build_mini_app_booking_summary(
+                master_row=master_row,
+                service_row=service_row,
+                date_str=date_str,
+                time_str=time_str,
+                client_name=str(prepared["clientName"]),
+                client_phone=str(prepared["clientPhone"]),
+                comment=prepared["comment"],
+                reference=reference,
+            ),
+            "expiresAt": serialize_api_datetime(datetime.fromisoformat(str(draft_row["expires_at"]))),
+        }
+    )
+
+
+@mini_app_api_handler
+async def mini_app_booking_confirm_handler(request: web.Request) -> web.Response:
+    payload = await read_mini_app_json_body(request)
+    owner_id = get_mini_app_owner_id(request, payload)
+    draft_id = str(payload.get("draftId") or "").strip()
+
+    if draft_id:
+        draft_row = get_mini_app_booking_draft(draft_id, owner_id)
+        if draft_row is None:
+            raise MiniAppApiError(
+                "draft_expired",
+                "Черновик записи истёк. Соберите запись заново.",
+                status=409,
+            )
+        master_row = get_mini_app_active_master(
+            owner_id,
+            int(draft_row["master_id"]),
+            allow_primary_fallback=False,
+        )
+        service_row = get_mini_app_service(
+            owner_id,
+            int(draft_row["service_id"]),
+            master_id=int(master_row["id"]),
+        )
+        date_str = str(draft_row["appointment_date"])
+        time_str = str(draft_row["appointment_time"])
+        client_name = str(draft_row["client_name"])
+        client_phone = str(draft_row["client_phone"])
+        comment = str(draft_row["client_comment"]).strip() if draft_row["client_comment"] else None
+        reference = serialize_mini_app_reference_from_row(draft_row)
+        telegram_user_id = int(draft_row["telegram_user_id"]) if draft_row["telegram_user_id"] is not None else None
+        manager_id = int(draft_row["manager_id"]) if draft_row["manager_id"] is not None else None
+    else:
+        prepared = prepare_mini_app_booking_payload(owner_id, payload)
+        master_row = prepared["masterRow"]
+        service_row = prepared["serviceRow"]
+        date_str = str(prepared["date"])
+        time_str = str(prepared["time"])
+        client_name = str(prepared["clientName"])
+        client_phone = str(prepared["clientPhone"])
+        comment = prepared["comment"]
+        reference = prepared["reference"]
+        telegram_user_id = prepared["telegramUserId"]
+        manager_id = prepared["managerId"]
+
+    if not is_slot_free(
+        date_str,
+        time_str,
+        demo_owner_id=owner_id,
+        master_id=int(master_row["id"]),
+    ):
+        raise MiniAppApiError(
+            "slot_already_taken",
+            "Этот слот уже занят. Выберите другой.",
+            status=409,
+        )
+
+    user_id = int(telegram_user_id or owner_id)
+    if telegram_user_id is not None:
+        upsert_user(user_id, client_name, None)
+        upsert_workspace_user(owner_id, user_id, client_name, None)
+        if manager_id is not None and manager_id != user_id:
+            _is_new, manager_changed = assign_demo_lead(user_id, manager_id)
+            if manager_changed:
+                await notify_owner_about_new_lead(
+                    manager_id=manager_id,
+                    lead_user_id=user_id,
+                    lead_full_name=client_name,
+                    lead_username=None,
+                )
+                await notify_manager_about_new_lead(
+                    manager_id=manager_id,
+                    lead_user_id=user_id,
+                    lead_full_name=client_name,
+                    lead_username=None,
+                )
+
+    appointment_id = create_appointment(
+        demo_owner_id=owner_id,
+        master_id=int(master_row["id"]),
+        master_name=str(master_row["name"]),
+        user_id=user_id,
+        client_name=client_name,
+        phone=client_phone,
+        service=str(service_row["name"]),
+        client_comment=comment,
+        source_file_id=reference["fileId"] if isinstance(reference, dict) else None,
+        source_file_type=reference["type"] if isinstance(reference, dict) else None,
+        source_file_name=reference.get("fileName") if isinstance(reference, dict) else None,
+        appointment_date=date_str,
+        appointment_time=time_str,
+    )
+    if appointment_id is None:
+        raise MiniAppApiError(
+            "slot_already_taken",
+            "Этот слот уже занят. Выберите другой.",
+            status=409,
+        )
+
+    schedule_reminders_for_appointment(appointment_id, date_str, time_str)
+    await notify_admin_about_new_appointment(appointment_id)
+
+    if draft_id:
+        delete_mini_app_booking_draft(draft_id, owner_id)
+
+    return web.json_response(
+        {
+            "bookingId": appointment_id,
+            "status": "confirmed",
+            "summary": build_mini_app_booking_summary(
+                master_row=master_row,
+                service_row=service_row,
+                date_str=date_str,
+                time_str=time_str,
+                client_name=client_name,
+                client_phone=client_phone,
+                comment=comment,
+                reference=reference,
+            ),
+            "success": {
+                "title": "Запись подтверждена",
+                "text": "Спасибо. Если что-то изменится, мы заранее предупредим вас.",
+            },
+        },
+        status=201,
+    )
+
+
+def build_mini_app_api_app() -> web.Application:
+    app = web.Application(middlewares=[mini_app_cors_middleware])
+    app.router.add_get("/mini-app/health", mini_app_health_handler)
+    app.router.add_get("/mini-app/home", mini_app_home_handler)
+    app.router.add_get("/mini-app/masters", mini_app_masters_handler)
+    app.router.add_get("/mini-app/services", mini_app_services_handler)
+    app.router.add_get("/mini-app/availability/dates", mini_app_availability_dates_handler)
+    app.router.add_get("/mini-app/availability/slots", mini_app_availability_slots_handler)
+    app.router.add_post("/mini-app/bookings/draft", mini_app_booking_draft_handler)
+    app.router.add_post("/mini-app/bookings/confirm", mini_app_booking_confirm_handler)
+    return app
+
+
+async def start_mini_app_api_server() -> web.AppRunner:
+    app = build_mini_app_api_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, MINI_APP_API_HOST, MINI_APP_API_PORT)
+    await site.start()
+    print(f"[mini-app] API started on {MINI_APP_API_HOST}:{MINI_APP_API_PORT}")
+    return runner
+
+
 def format_master_public_card_text(master_id: int, demo_owner_id: int | None = None) -> str:
     owner_id = resolve_db_demo_owner_id(demo_owner_id)
     row = get_master_by_id(master_id, demo_owner_id=owner_id)
@@ -4967,8 +5820,20 @@ def sale_support_kb(back_callback: str = "sale:open") -> InlineKeyboardMarkup:
     )
 
 
-def mini_app_launch_kb() -> InlineKeyboardMarkup:
-    if not MINI_APP_URL:
+def build_mini_app_launch_url(user_id: int) -> str:
+    base_url = (MINI_APP_URL or "").strip()
+    if not base_url:
+        return ""
+    workspace_owner_id = resolve_demo_owner_id_for_user(user_id)
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["ownerId"] = str(workspace_owner_id)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def mini_app_launch_kb(user_id: int) -> InlineKeyboardMarkup:
+    launch_url = build_mini_app_launch_url(user_id)
+    if not launch_url:
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:main_menu")],
@@ -4976,7 +5841,7 @@ def mini_app_launch_kb() -> InlineKeyboardMarkup:
         )
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Открыть Mini App", web_app=WebAppInfo(url=MINI_APP_URL))],
+            [InlineKeyboardButton(text="📱 Открыть Mini App", web_app=WebAppInfo(url=launch_url))],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:main_menu")],
         ]
     )
@@ -6429,57 +7294,39 @@ async def open_booking_phone_step(
 
 
 async def open_mini_app_screen_for_message(user_id: int) -> None:
-    if not is_owner(user_id):
-        await render_inline_screen(
-            user_id,
-            "🚧 Mini App уже скоро.\n\n"
-            "Готовим отдельный интерфейс с более плавным опытом. Откроем доступ после релиза.",
-            reply_markup=demo_buyer_home_kb() if get_user_role(user_id) == "demo_buyer" else None,
-        )
-        return
-
     if not MINI_APP_URL:
         await render_inline_screen(
             user_id,
-            "🧪 Раздел Mini App подготовлен.\n\n"
-            "Для тестового запуска укажите переменную MINI_APP_URL в .env.",
+            "📱 Mini App пока не подключён.\n\n"
+            "Укажите переменную MINI_APP_URL, чтобы открыть приложение из бота.",
             reply_markup=main_menu_kb(user_id),
         )
         return
 
     await render_inline_screen(
         user_id,
-        "🧪 Mini App (тестовый доступ)\n\n"
-        "Нажмите кнопку ниже, чтобы открыть приложение.",
-        reply_markup=mini_app_launch_kb(),
+        "📱 Mini App\n\n"
+        "Откройте приложение кнопкой ниже. Внутри будет более плавный и красивый клиентский путь записи.",
+        reply_markup=mini_app_launch_kb(user_id),
     )
 
 
 async def open_mini_app_screen_for_callback(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    if not is_owner(user_id):
-        await render_inline_screen_from_callback(
-            callback,
-            "🚧 Mini App уже скоро.\n\n"
-            "Готовим отдельный интерфейс с более плавным опытом. Откроем доступ после релиза.",
-            reply_markup=demo_buyer_home_kb() if get_user_role(user_id) == "demo_buyer" else None,
-        )
-        return
-
     if not MINI_APP_URL:
         await render_inline_screen_from_callback(
             callback,
-            "🧪 Раздел Mini App подготовлен.\n\n"
-            "Для тестового запуска укажите переменную MINI_APP_URL в .env.",
-            reply_markup=mini_app_launch_kb(),
+            "📱 Mini App пока не подключён.\n\n"
+            "Укажите переменную MINI_APP_URL, чтобы открыть приложение из бота.",
+            reply_markup=main_menu_kb(user_id),
         )
         return
 
     await render_inline_screen_from_callback(
         callback,
-        "🧪 Mini App (тестовый доступ)\n\n"
-        "Нажмите кнопку ниже, чтобы открыть приложение.",
-        reply_markup=mini_app_launch_kb(),
+        "📱 Mini App\n\n"
+        "Откройте приложение кнопкой ниже. Внутри будет более плавный и красивый клиентский путь записи.",
+        reply_markup=mini_app_launch_kb(user_id),
     )
 
 
@@ -10431,6 +11278,7 @@ async def admin_cancel_appointment_confirm(callback: CallbackQuery) -> None:
 async def main() -> None:
     global bot_instance
 
+    mini_app_api_runner: web.AppRunner | None = None
     init_db()
     ensure_demo_workspace(OWNER_ID_INT)
     bot_instance = patch_bot_text_output(
@@ -10440,10 +11288,13 @@ async def main() -> None:
 
     scheduler.start()
     restore_reminders_from_db()
+    mini_app_api_runner = await start_mini_app_api_server()
 
     try:
         await dp.start_polling(bot_instance)
     finally:
+        if mini_app_api_runner is not None:
+            await mini_app_api_runner.cleanup()
         scheduler.shutdown(wait=False)
         await bot_instance.session.close()
 
